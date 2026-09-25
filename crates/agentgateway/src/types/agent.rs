@@ -1832,11 +1832,28 @@ pub struct McpBackend {
 	#[serde(with = "crate::serdes::serde_dur")]
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
 	pub session_idle_ttl: Duration,
+	/// Interval at which SSE keep-alive comments are sent on long-lived MCP streams.
+	/// Disabled when unset. Without it, a stream that legitimately carries no traffic
+	/// (for example a `FailOpen` GET stream held open with no reachable upstream, or an
+	/// idle session) is indistinguishable from a dead connection and is dropped by
+	/// intermediaries such as load balancers and API gateways.
+	#[serde(
+		default,
+		with = "crate::serdes::serde_dur_option",
+		skip_serializing_if = "Option::is_none"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub sse_keep_alive: Option<Duration>,
 	/// When true, reject MCP requests whose Host/Origin is not localhost
 	/// (`localhost`, `127.0.0.1`, `[::1]`, with optional port). Off by default:
 	/// agentgateway is typically not a browser-facing localhost MCP server.
 	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
 	pub dns_rebinding_protection: bool,
+	/// Overrides for the MCP `serverInfo` and gateway instructions reported to clients on
+	/// `initialize`/`server/discover` when multiplexing multiple targets. Unset fields fall
+	/// back to the normal defaults.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server: Option<McpServerOverrides>,
 }
 
 impl McpBackend {
@@ -1849,9 +1866,45 @@ impl McpBackend {
 	}
 }
 
+/// Overrides for the MCP `serverInfo` (`name`/`version`/`title`) and the gateway
+/// instructions preamble, applied only when multiplexing multiple targets.
+#[apply(schema!)]
+pub struct McpServerOverrides {
+	/// Overrides `serverInfo.name`. Must be set together with `version` — setting only one
+	/// would otherwise mix an overridden name with agentgateway's own version, or vice versa.
+	/// Defaults to `agentgateway` when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub name: Option<Strng>,
+	/// Overrides `serverInfo.version`. Must be set together with `name`, for the same reason.
+	/// Defaults to the build version when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub version: Option<Strng>,
+	/// Overrides `serverInfo.title`. Unset by default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub title: Option<Strng>,
+	/// Overrides the gateway preamble prepended to merged upstream instructions.
+	/// Defaults to a generic gateway description when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instructions: Option<Strng>,
+}
+
+impl McpServerOverrides {
+	pub fn validate(&self) -> Result<(), String> {
+		if self.name.is_some() != self.version.is_some() {
+			return Err(
+				"mcp server overrides: `name` and `version` must be set together, or left both unset"
+					.to_string(),
+			);
+		}
+		Ok(())
+	}
+}
+
 #[apply(schema_ser_schema!)]
 pub struct McpTarget {
 	pub name: McpTargetName,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub condition: Option<Arc<crate::cel::Expression>>,
 	#[serde(flatten)]
 	pub spec: McpTargetSpec,
 }
@@ -3723,8 +3776,8 @@ clientSecret: "s3cret"
 resourceMetadata:
   mcpResourceUri: "mcp://test"
 "#;
-		// Parse via yamlviajson, matching how config files are loaded (map-style enum variants).
-		let auth: LocalMcpAuthentication = serdes::yamlviajson::from_str(yaml).unwrap();
+		// Parse via yaml, matching how config files are loaded (map-style enum variants).
+		let auth: LocalMcpAuthentication = serdes::yaml::from_str(yaml).unwrap();
 		assert!(matches!(auth.provider, Some(McpIDP::Entra {})));
 		assert_eq!(auth.client_id.as_deref(), Some("client-id-guid"));
 		assert!(auth.client_secret.is_some());
@@ -3738,7 +3791,7 @@ issuer: "https://example.com"
 jwks: '{"keys":[]}'
 resourceMetadata: {}
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		assert_eq!(auth.audiences, None);
 
 		match auth.as_jwt().unwrap() {
@@ -3758,7 +3811,7 @@ jwks: '{"keys":[]}'
 resourceMetadata:
   mcpResourceUri: "mcp://test"
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		assert_eq!(
 			auth.jwt_validation_options.required_claims,
 			std::collections::HashSet::from(["exp".to_owned()]),
@@ -3776,7 +3829,7 @@ resourceMetadata:
   mcpResourceUri: "mcp://test"
 jwtValidationOptions: {}
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		assert_eq!(
 			auth.jwt_validation_options.required_claims,
 			std::collections::HashSet::from(["exp".to_owned()]),
@@ -3795,7 +3848,7 @@ resourceMetadata:
 jwtValidationOptions:
   requiredClaims: []
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		assert!(
 			auth.jwt_validation_options.required_claims.is_empty(),
 			"required_claims should be empty"
@@ -3813,7 +3866,7 @@ resourceMetadata:
 jwtValidationOptions:
   requiredClaims: ["exp", "nbf"]
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		assert_eq!(
 			auth.jwt_validation_options.required_claims,
 			std::collections::HashSet::from(["exp".to_owned(), "nbf".to_owned()])
@@ -3831,7 +3884,7 @@ resourceMetadata:
 jwtValidationOptions:
   requiredClaims: []
 "#;
-		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		let auth: LocalMcpAuthentication = serde_norway::from_str(yaml).unwrap();
 		let jwt_config = auth.as_jwt().unwrap();
 
 		match jwt_config {

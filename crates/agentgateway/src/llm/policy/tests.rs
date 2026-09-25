@@ -8,7 +8,7 @@ use crate::types::agent::HeaderValueMatch;
 /// must not additionally record `Allow`.
 #[tokio::test]
 async fn webhook_fail_open_emits_single_metric() {
-	use crate::types::agent::SimpleBackendReference;
+	use crate::types::agent::{SimpleBackendReference, SimpleBackendReferenceWithPolicies};
 
 	let guard = PromptGuard {
 		streaming: Default::default(),
@@ -16,7 +16,10 @@ async fn webhook_fail_open_emits_single_metric() {
 			rejection: Default::default(),
 			scope: default_content_scope(),
 			kind: RequestGuardKind::Webhook(Webhook {
-				target: SimpleBackendReference::Invalid,
+				target: SimpleBackendReferenceWithPolicies {
+					target: Arc::new(SimpleBackendReference::Invalid),
+					policies: vec![],
+				},
 				headers: Default::default(),
 				forward_header_matches: vec![],
 				failure_mode: FailureMode::FailOpen,
@@ -91,10 +94,17 @@ async fn audit_mode_records_allow_when_nothing_matches() {
 		content: "nothing sensitive here".to_string(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&headers,
+		&client,
+		None,
+		None,
+		Some(&mut false),
+	)
+	.await
+	.unwrap();
 	assert!(rejection.is_none(), "audit mode must never reject");
 	Policy::record_guardrail_trip(&client, GuardrailPhase::Response, action);
 
@@ -127,10 +137,17 @@ async fn audit_mode_records_audit_and_passes_through_on_match() {
 		content: original.clone(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&headers,
+		&client,
+		None,
+		None,
+		Some(&mut false),
+	)
+	.await
+	.unwrap();
 	assert_eq!(
 		action,
 		GuardrailAction::Audit,
@@ -277,6 +294,7 @@ fn model_armor_blocked_records_guardrail_info() {
 	}))
 	.unwrap();
 	let config = GoogleModelArmor {
+		failure_mode: FailureMode::FailClosed,
 		template_id: strng::new("templates/my-template"),
 		project_id: strng::new("proj"),
 		location: None,
@@ -943,6 +961,7 @@ fn bedrock_anonymized_assessments() -> serde_json::Value {
 
 fn bedrock_test_config() -> BedrockGuardrails {
 	BedrockGuardrails {
+		failure_mode: FailureMode::FailClosed,
 		guardrail_identifier: strng::new("gr-test"),
 		guardrail_version: strng::new("1"),
 		region: strng::new("us-west-2"),
@@ -2206,6 +2225,7 @@ fn test_bedrock_guardrails_user_credentials_take_precedence() {
 	use crate::types::agent::BackendTrafficPolicy;
 
 	let guardrails = BedrockGuardrails {
+		failure_mode: FailureMode::FailClosed,
 		guardrail_identifier: strng::new("test-guardrail"),
 		guardrail_version: strng::new("1"),
 		region: strng::new("us-east-1"),
@@ -2250,6 +2270,7 @@ fn test_bedrock_guardrails_api_key_auth_takes_precedence() {
 	use crate::types::agent::BackendTrafficPolicy;
 
 	let guardrails = BedrockGuardrails {
+		failure_mode: FailureMode::FailClosed,
 		guardrail_identifier: strng::new("test-guardrail"),
 		guardrail_version: strng::new("1"),
 		region: strng::new("us-east-1"),
@@ -2288,6 +2309,7 @@ fn test_bedrock_guardrails_implicit_auth_used_when_no_user_credentials() {
 	use crate::store::BindStore;
 
 	let guardrails = BedrockGuardrails {
+		failure_mode: FailureMode::FailClosed,
 		guardrail_identifier: strng::new("test-guardrail"),
 		guardrail_version: strng::new("1"),
 		region: strng::new("us-west-2"),
@@ -2326,6 +2348,7 @@ fn test_google_model_armor_user_credentials_take_precedence() {
 	use crate::types::agent::BackendTrafficPolicy;
 
 	let model_armor = GoogleModelArmor {
+		failure_mode: FailureMode::FailClosed,
 		template_id: strng::new("test-template"),
 		project_id: strng::new("test-project"),
 		location: Some(strng::new("us-central1")),
@@ -2364,6 +2387,7 @@ fn test_google_model_armor_implicit_auth_used_when_no_user_credentials() {
 	use crate::store::BindStore;
 
 	let model_armor = GoogleModelArmor {
+		failure_mode: FailureMode::FailClosed,
 		template_id: strng::new("test-template"),
 		project_id: strng::new("test-project"),
 		location: None,

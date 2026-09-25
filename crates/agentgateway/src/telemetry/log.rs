@@ -1,9 +1,7 @@
 use std::borrow::Cow;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::metrics::CustomField;
@@ -13,10 +11,10 @@ use agent_core::telemetry::{
 	quoted,
 };
 use agent_core::{Timestamp, strng};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use crossbeam::atomic::AtomicCell;
 use frozen_collections::FzHashSet;
-use http_body::{Body, Frame, SizeHint};
+use http_body::Frame;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
@@ -42,8 +40,9 @@ use crate::llm::catalog::{CostLookupStatus, ModelCatalog};
 use crate::mcp::{MCPInfo, MCPOperation};
 use crate::proxy::{ProxyResponseReason, dtrace};
 use crate::telemetry::metrics::{
-	CostCatalogLookupLabels, GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, Metrics,
-	OutboundCallLabels, RouteIdentifier, SubstrateRouteLabels,
+	CostCatalogLookupLabels, ErrorTypeLabel, GenAIErrorType, GenAILabels, GenAILabelsTokenUsage,
+	GenAIRequestDurationLabels, HTTPLabels, MCPCall, Metrics, OutboundCallLabels, RouteIdentifier,
+	SubstrateRouteLabels,
 };
 use crate::telemetry::trc::TraceParent;
 use crate::telemetry::{log_store, semconv, trc};
@@ -142,7 +141,7 @@ impl<'a> HttpSemconvAttributes<'a> {
 	}
 }
 
-fn database_llm_payload(
+pub(super) fn database_llm_payload(
 	mode: Option<crate::types::frontend::DatabaseLlmMode>,
 	input_messages: Option<&[agent_llm::types::NormalizedMessage]>,
 	info: Option<&LLMContext>,
@@ -379,7 +378,7 @@ impl<T: Debug> Debug for AsyncLog<T> {
 	}
 }
 
-/// Per-request accumulator of prompt-guard guardrail interventions.
+/// Per-request accumulator of prompt-guard guardrail evaluations.
 pub type GuardrailLog = AsyncLog<Vec<cel::GuardrailInfo>>;
 
 #[derive(serde::Serialize, Debug, Default, Clone)]
@@ -897,15 +896,44 @@ impl DropOnLog {
 		llm_response: Option<&LLMContext>,
 		custom_metric_fields: &CustomField,
 	) {
+		let request = log.llm_request.as_ref();
+		let Some(provider) = llm_response
+			.map(|response| response.provider.clone())
+			.or_else(|| request.map(|request| request.provider.clone()))
+		else {
+			return;
+		};
+		let request_model = llm_response
+			.map(|response| response.request_model.clone())
+			.or_else(|| request.map(|request| request.request_model.clone()));
+		let gen_ai_labels = Arc::new(GenAILabels {
+			gen_ai_operation_name: request
+				.map(|request| gen_ai_operation_name(request.input_format))
+				.map(RichStrng::from)
+				.into(),
+			gen_ai_system: provider.into(),
+			gen_ai_request_model: request_model.into(),
+			gen_ai_response_model: llm_response
+				.and_then(|response| response.response_model.clone())
+				.into(),
+			custom: custom_metric_fields.clone(),
+			route: route_identifier.clone(),
+		});
+
+		log
+			.metrics
+			.gen_ai_request_duration
+			.get_or_create(&GenAIRequestDurationLabels {
+				common: gen_ai_labels.clone().into(),
+				error: gen_ai_operation_failed(log)
+					.then_some(ErrorTypeLabel {
+						error_type: GenAIErrorType::Other,
+					})
+					.into(),
+			})
+			.observe(duration.as_secs_f64());
+
 		if let Some(llm_response) = llm_response {
-			let gen_ai_labels = Arc::new(GenAILabels {
-				gen_ai_operation_name: strng::literal!("chat").into(),
-				gen_ai_system: llm_response.provider.clone().into(),
-				gen_ai_request_model: llm_response.request_model.clone().into(),
-				gen_ai_response_model: llm_response.response_model.clone().into(),
-				custom: custom_metric_fields.clone(),
-				route: route_identifier.clone(),
-			});
 			if let Some(status) = llm_response.cost_status {
 				log
 					.metrics
@@ -985,11 +1013,6 @@ impl DropOnLog {
 					})
 					.observe(cwt as f64)
 			}
-			log
-				.metrics
-				.gen_ai_request_duration
-				.get_or_create(&gen_ai_labels)
-				.observe(duration.as_secs_f64());
 			if let Some(ttft) = llm_response
 				.time_to_first_token
 				.and_then(|duration| duration.0.to_std().ok())
@@ -1009,6 +1032,20 @@ impl DropOnLog {
 					.gen_ai_time_per_output_token
 					.get_or_create(&gen_ai_labels)
 					.observe(time_per_output_token.as_secs_f64());
+			}
+			if !llm_response.inter_chunk_latencies.is_empty() {
+				let hist = log
+					.metrics
+					.gen_ai_inter_chunk_latency
+					.get_or_create(&gen_ai_labels);
+				// Replay the bucketed summary: each bucket's mean is observed `count`
+				// times, so the resulting histogram's per-bucket counts and sum are
+				// identical to what observing every raw gap would have produced.
+				for (count, mean) in llm_response.inter_chunk_latencies.iter() {
+					for _ in 0..count {
+						hist.observe(mean);
+					}
+				}
 			}
 		}
 	}
@@ -1324,6 +1361,30 @@ fn request_log_level(error: Option<&str>) -> &'static str {
 	if error.is_some() { "error" } else { "info" }
 }
 
+fn gen_ai_operation_failed(request: &RequestLog) -> bool {
+	// A provider 4xx (such as rate limiting) fails the GenAI operation even though
+	// an inbound HTTP server span does not classify client errors as server failures.
+	request.error.is_some()
+		|| request.status.is_some_and(|status| {
+			status.is_server_error()
+				|| (status.is_client_error() && request.reason == Some(ProxyResponseReason::Upstream))
+		})
+}
+
+fn gen_ai_operation_name(input_format: InputFormat) -> &'static str {
+	match input_format {
+		InputFormat::Completions | InputFormat::Messages | InputFormat::Responses => "chat",
+		InputFormat::Gemini => "generate_content",
+		InputFormat::Embeddings => "embeddings",
+		// These operations have no standard GenAI operation name. Keep the custom values bounded.
+		InputFormat::Realtime => "realtime",
+		InputFormat::Rerank => "rerank",
+		InputFormat::CountTokens | InputFormat::GeminiCountTokens => "count_tokens",
+		// Detection has not identified the operation; do not assume it is chat.
+		InputFormat::Detect => "unknown",
+	}
+}
+
 impl Drop for DropOnLog {
 	fn drop(&mut self) {
 		let status = self
@@ -1399,7 +1460,7 @@ impl Drop for DropOnLog {
 			let request_handle = log.request_handle.take();
 			let cel_end_time = cel::RequestTime(end_time.as_datetime());
 			// The response snapshot is captured before the response body is drained, so
-			// trailer-only grpc-status values are learned later by LogBody. Copy the final
+			// Trailer-only grpc-status values are learned later by the body observer. Copy the final
 			// value back into the snapshot before evaluating access-log CEL fields.
 			if let Some(grpc_status) = log.grpc_status.load()
 				&& let Some(resp) = log.response_snapshot.as_mut()
@@ -1530,7 +1591,8 @@ impl Drop for DropOnLog {
 			let otlp_log_enabled = log.otel_logger.is_some();
 			// For now we only enable this log for LLM requests to keep cost/performance appropriate.
 			let log_store_enabled = log_store::enabled()
-				&& (llm_response.is_some()
+				&& (log.llm_request.is_some()
+					|| llm_response.is_some()
 					|| log
 						.listener_name
 						.as_ref()
@@ -1568,6 +1630,7 @@ impl Drop for DropOnLog {
 						("agw.ai.usage.cost.reasoning", b.reasoning.to_string()),
 						("agw.ai.usage.cost.input_audio", b.input_audio.to_string()),
 						("agw.ai.usage.cost.output_audio", b.output_audio.to_string()),
+						("agw.ai.usage.cost.pages", b.pages.to_string()),
 					]
 				})
 			} else {
@@ -2098,6 +2161,7 @@ impl Drop for DropOnLog {
 							("agw.ai.usage.cost.reasoning", cost.reasoning),
 							("agw.ai.usage.cost.inputAudio", cost.input_audio),
 							("agw.ai.usage.cost.outputAudio", cost.output_audio),
+							("agw.ai.usage.cost.pages", cost.pages),
 						];
 						db_kv.reserve(cost_raws.len());
 						for (k, v) in &cost_raws {
@@ -2106,18 +2170,12 @@ impl Drop for DropOnLog {
 						}
 					}
 					let attributes = database_attributes(&db_kv);
-					let payload = database_llm_payload(
-						log.database_llm,
-						log.input_messages.as_deref().map(Vec::as_slice),
-						llm_response.as_ref(),
-					);
-					let has_payload = payload.is_some();
 					let total_tokens = llm_response.as_ref().and_then(|llm| {
 						llm
 							.total_tokens
 							.or_else(|| Some(llm.input_tokens?.saturating_add(llm.output_tokens?)))
 					});
-					log_store::emit(log_store::StoredRequestLog {
+					let record = log_store::StoredRequestLog {
 						id: uuid::Uuid::now_v7().to_string(),
 						started_at: log.start.as_datetime().with_timezone(&chrono::Utc),
 						completed_at: end_time.as_datetime().with_timezone(&chrono::Utc),
@@ -2126,13 +2184,10 @@ impl Drop for DropOnLog {
 						span_id: span_id.map(|id| id.to_string()),
 						http_status: log.status.as_ref().map(|s| i64::from(s.as_u16())),
 						error: log.error.clone(),
-						gen_ai_operation_name: log.llm_request.as_ref().map(|request| {
-							if request.input_format == InputFormat::Embeddings {
-								"embeddings".to_string()
-							} else {
-								"chat".to_string()
-							}
-						}),
+						gen_ai_operation_name: log
+							.llm_request
+							.as_ref()
+							.map(|request| gen_ai_operation_name(request.input_format).to_string()),
 						gen_ai_provider_name: log
 							.llm_request
 							.as_ref()
@@ -2151,9 +2206,15 @@ impl Drop for DropOnLog {
 						agentgateway_user: attributes.agentgateway_user,
 						agentgateway_group: attributes.agentgateway_group,
 						user_agent_name: attributes.user_agent_name,
-						has_payload,
+						has_payload: false,
 						attributes_json: attributes.json,
-						payload,
+						payload: None,
+					};
+					log_store::emit(log_store::PendingRequestLog {
+						record,
+						llm_mode: log.database_llm,
+						input_messages: log.input_messages.take(),
+						llm_response,
 					});
 				}
 			}
@@ -2161,73 +2222,26 @@ impl Drop for DropOnLog {
 	}
 }
 
-pin_project_lite::pin_project! {
-		/// A data stream created from a [`Body`].
-		#[derive(Debug)]
-		pub struct LogBody<B> {
-				#[pin]
-				body: B,
-				log: DropOnLog,
-		}
-}
-
-impl<B> LogBody<B> {
-	/// Create a new `LogBody`
-	pub fn new(body: B, log: DropOnLog) -> Self {
-		Self { body, log }
-	}
-}
-
-impl<B: Body + Debug> Body for LogBody<B>
-where
-	B::Data: Debug,
-	B::Error: Display,
-{
-	type Data = B::Data;
-	type Error = B::Error;
-
-	fn poll_frame(
-		self: Pin<&mut Self>,
-		cx: &mut Context<'_>,
-	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-		let this = self.project();
-		let result = ready!(this.body.poll_frame(cx));
-		match result {
-			Some(Ok(frame)) => {
-				if let Some(trailer) = frame.trailers_ref()
-					&& let Some(grpc) = this.log.as_mut().map(|log| log.grpc_status.clone())
-				{
-					crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
-				}
-				if let Some(log) = this.log.as_mut()
-					&& let Some(data) = frame.data_ref()
-				{
-					// Count the bytes in this data frame
-					log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
-				}
-				Poll::Ready(Some(Ok(frame)))
-			},
-			Some(Err(e)) => {
-				// The head is long gone by the time the body fails, so nothing else records this:
-				// without it a stream torn down mid-flight is logged as whatever status we already
-				// sent, indistinguishable from one the client read to completion.
-				if let Some(log) = this.log.as_mut()
-					&& log.error.is_none()
-				{
-					log.error = Some(format!("response body failed: {e}"));
-				}
-				Poll::Ready(Some(Err(e)))
-			},
-			None => Poll::Ready(None),
+impl agent_http::BodyObserver for DropOnLog {
+	fn on_error(&mut self, error: &crate::http::Error) {
+		// Response headers have already been sent; retain the body failure in the log.
+		if let Some(log) = self.as_mut()
+			&& log.error.is_none()
+		{
+			log.error = Some(format!("response body failed: {error}"));
 		}
 	}
-
-	fn is_end_stream(&self) -> bool {
-		self.body.is_end_stream()
-	}
-
-	fn size_hint(&self) -> SizeHint {
-		self.body.size_hint()
+	fn on_frame(&mut self, frame: &Frame<Bytes>) {
+		if let Some(trailer) = frame.trailers_ref()
+			&& let Some(grpc) = self.as_mut().map(|log| log.grpc_status.clone())
+		{
+			crate::proxy::httpproxy::maybe_set_grpc_status(&grpc, trailer);
+		}
+		if let Some(log) = self.as_mut()
+			&& let Some(data) = frame.data_ref()
+		{
+			log.response_bytes = log.response_bytes.saturating_add(data.remaining() as u64);
+		}
 	}
 }
 
@@ -2418,11 +2432,14 @@ impl OtelAccessLogger {
 				.build()
 		};
 
-		let logger = provider.logger("agentgateway.access");
+		Ok(Self::from_provider(provider))
+	}
 
-		Ok(Self {
+	fn from_provider(provider: SdkLoggerProvider) -> Self {
+		let logger = provider.logger("agentgateway.access");
+		Self {
 			inner: super::NonBlockingDrop::new(OtelAccessLoggerInner { provider, logger }),
-		})
+		}
 	}
 
 	pub fn shutdown(&self) {
@@ -2431,7 +2448,7 @@ impl OtelAccessLogger {
 }
 
 impl OtelLogSink for OtelAccessLogger {
-	fn emit<'v>(&self, level: &str, target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
+	fn emit<'v>(&self, level: &str, _target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
 		let severity = match level {
 			"error" => Severity::Error,
 			"warn" => Severity::Warn,
@@ -2452,7 +2469,6 @@ impl OtelLogSink for OtelAccessLogger {
 		let mut record = self.inner.logger.create_log_record();
 		record.set_severity_number(severity);
 		record.set_severity_text(severity_text);
-		record.set_target(target.to_string());
 
 		let mut trace_id_val: Option<u128> = None;
 		let mut span_id_val: Option<u64> = None;
@@ -2735,9 +2751,11 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	use std::time::Instant;
 
+	use opentelemetry::InstrumentationScope;
 	use opentelemetry::trace::SpanKind;
 	use opentelemetry_sdk::error::OTelSdkResult;
 	use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+	use prometheus_client::encoding::text::encode;
 	use prometheus_client::registry::Registry;
 
 	use super::*;
@@ -2747,6 +2765,44 @@ mod tests {
 	use crate::telemetry::trc;
 	use crate::transport::stream::TCPConnectionInfo;
 	use crate::types::frontend::{DatabaseLlmMode, LoggingPolicy};
+
+	#[derive(Clone, Debug, Default)]
+	struct RecordingLogExporter {
+		records: Arc<Mutex<Vec<(opentelemetry_sdk::logs::SdkLogRecord, InstrumentationScope)>>>,
+	}
+
+	impl opentelemetry_sdk::logs::LogExporter for RecordingLogExporter {
+		fn export(
+			&self,
+			batch: opentelemetry_sdk::logs::LogBatch<'_>,
+		) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+			let mut records = self.records.lock().unwrap();
+			for (record, scope) in batch.iter() {
+				records.push((record.clone(), scope.clone()));
+			}
+			ready(Ok(()))
+		}
+	}
+
+	#[test]
+	fn otlp_access_log_scope_is_logger_name_not_tracing_target() {
+		let exporter = RecordingLogExporter::default();
+		let provider = SdkLoggerProvider::builder()
+			.with_simple_exporter(exporter.clone())
+			.build();
+		let logger = OtelAccessLogger::from_provider(provider);
+
+		let kv = [("http.request.method", Some(ValueBag::from("GET")))];
+		logger.emit("info", "request", &kv);
+		logger.inner.provider.force_flush().unwrap();
+
+		let records = exporter.records.lock().unwrap();
+		assert_eq!(records.len(), 1);
+		let (record, scope) = &records[0];
+		assert_eq!(scope.name(), "agentgateway.access");
+		// opentelemetry-proto uses a record target as the wire scope name when one is set.
+		assert!(record.target().is_none());
+	}
 
 	#[derive(Clone, Debug, Default)]
 	struct RecordingSpanExporter {
@@ -2786,10 +2842,6 @@ mod tests {
 		)
 	}
 
-	fn test_request_log() -> RequestLog {
-		test_request_log_with_registry().0
-	}
-
 	fn test_request_log_with_registry() -> (RequestLog, Registry) {
 		let cel = CelLogging {
 			cel_context: crate::cel::ContextBuilder::new(),
@@ -2819,6 +2871,30 @@ mod tests {
 			},
 		);
 		(log, registry)
+	}
+
+	fn test_request_log() -> RequestLog {
+		test_request_log_with_registry().0
+	}
+
+	fn metric_test_llm_request() -> llm::LLMRequest {
+		llm::LLMRequest {
+			input_tokens: None,
+			input_format: llm::InputFormat::Responses,
+			cache_convention: Default::default(),
+			request_model: "test-model".into(),
+			provider: "test-provider".into(),
+			streaming: false,
+			params: Default::default(),
+			prompt: None,
+			provider_state: None,
+		}
+	}
+
+	fn encoded_metrics(registry: &Registry) -> String {
+		let mut encoded = String::new();
+		encode(&mut encoded, registry).unwrap();
+		encoded
 	}
 
 	#[test]
@@ -2938,6 +3014,306 @@ mod tests {
 		let mut context = LLMContext::from(request);
 		context.completion = Some(vec!["world".to_string()]);
 		context
+	}
+
+	#[test]
+	fn gen_ai_request_duration_records_success_and_failure_outcomes() {
+		for (status, error, reason, expected_error_type) in [
+			(http::StatusCode::OK, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::DirectResponse),
+				None,
+			),
+			(http::StatusCode::TOO_MANY_REQUESTS, None, None, None),
+			(
+				http::StatusCode::BAD_REQUEST,
+				Some("invalid request"),
+				Some(ProxyResponseReason::InvalidRequest),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::TOO_MANY_REQUESTS,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				None,
+				Some(ProxyResponseReason::Upstream),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::BAD_GATEWAY,
+				Some("connection failed"),
+				Some(ProxyResponseReason::UpstreamFailure),
+				Some("_OTHER"),
+			),
+			(
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+				Some("unclassified failure"),
+				None,
+				Some("_OTHER"),
+			),
+		] {
+			let (mut log, registry) = test_request_log_with_registry();
+			log.status = Some(status);
+			log.error = error.map(str::to_string);
+			log.reason = reason;
+			log.llm_request = Some(metric_test_llm_request());
+
+			drop(DropOnLog::from(log));
+
+			let encoded = encoded_metrics(&registry);
+			let count = encoded
+				.lines()
+				.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+				.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+			match expected_error_type {
+				Some(expected) => assert!(
+					count.contains(&format!("error_type=\"{expected}\"")),
+					"expected error.type {expected} in: {count}"
+				),
+				None => assert!(
+					!count.contains("error_type="),
+					"successful request unexpectedly has error.type: {count}"
+				),
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_duration_preserves_response_failures_and_snapshot_metadata() {
+		use crate::http::transformation_cel::TransformationMetadata;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+		use crate::proxy::{ProxyError, ProxyResponse};
+
+		for upstream_failed in [false, true] {
+			for policy in ["none", "error", "direct"] {
+				let (mut log, registry) = test_request_log_with_registry();
+				log.llm_request = Some(metric_test_llm_request());
+				log
+					.cel
+					.ctx()
+					.register_log_expression(&Expression::new_strict("proxy.error").unwrap());
+				let initial = if upstream_failed {
+					Err(ProxyError::NoHealthyEndpoints.into())
+				} else {
+					Ok(::http::Response::new(crate::http::Body::empty()))
+				};
+				let (mut response, mut reason) = resolve_response(initial, &mut log, false);
+				let original_reason = reason;
+				let metadata = TransformationMetadata(serde_json::Map::from_iter([(
+					"marker".to_string(),
+					serde_json::json!("retained"),
+				)]));
+				response.extensions_mut().insert(metadata.clone());
+				match policy {
+					"error" => {
+						(response, reason) = resolve_response(
+							Err(ProxyError::ProcessingString("policy failed".to_string()).into()),
+							&mut log,
+							false,
+						);
+						response.extensions_mut().insert(metadata.clone());
+					},
+					"direct" => {
+						let mut replacement = ::http::Response::builder()
+							.status(http::StatusCode::TOO_MANY_REQUESTS)
+							.body(crate::http::Body::empty())
+							.unwrap();
+						replacement.extensions_mut().insert(metadata.clone());
+						(response, reason) = resolve_response(
+							Err(ProxyResponse::DirectResponse(Box::new(replacement))),
+							&mut log,
+							false,
+						);
+					},
+					_ => {},
+				}
+				let expected_reason = match policy {
+					"error" => ProxyError::ProcessingString("policy failed".to_string()).as_reason(),
+					"direct" => ProxyResponseReason::DirectResponse,
+					_ => original_reason,
+				};
+				assert_eq!(reason, expected_reason);
+				let failed = upstream_failed || policy == "error";
+				assert_eq!(log.error.is_some(), failed);
+				if upstream_failed {
+					assert!(
+						log
+							.error
+							.as_ref()
+							.unwrap()
+							.contains(&ProxyError::NoHealthyEndpoints.to_string())
+					);
+				}
+				if policy == "error" {
+					assert!(log.error.as_ref().unwrap().contains("policy failed"));
+				}
+				// Resolution must leave extensions intact for the single final snapshot.
+				assert!(log.response_snapshot.is_none());
+				assert_eq!(
+					response
+						.extensions()
+						.get::<TransformationMetadata>()
+						.unwrap()
+						.0,
+					metadata.0
+				);
+				assert_eq!(
+					response
+						.extensions()
+						.get::<cel::ProxyContext>()
+						.and_then(|context| context.error.as_ref())
+						.is_some(),
+					failed
+				);
+				set_final_response_fields(&mut log, &reason, &mut response);
+				assert_eq!(log.status, Some(response.status()));
+				assert_eq!(log.reason, Some(reason));
+				let snapshot = log.response_snapshot.as_ref().unwrap();
+				assert_eq!(snapshot.metadata.as_ref().unwrap().0, metadata.0);
+				let error = snapshot
+					.proxy
+					.as_ref()
+					.and_then(|context| context.error.as_ref());
+				assert_eq!(error.is_some(), failed);
+				if let Some(error) = error {
+					assert_eq!(Some(&error.message), log.error.as_ref());
+					assert_eq!(
+						error.reason,
+						if policy == "direct" {
+							original_reason
+						} else {
+							reason
+						}
+						.to_string()
+					);
+				}
+				drop(DropOnLog::from(log));
+				let encoded = encoded_metrics(&registry);
+				let count = encoded
+					.lines()
+					.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+					.unwrap();
+				assert_eq!(count.contains("error_type=\"_OTHER\""), failed, "{count}");
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_metrics_use_the_request_operation() {
+		for (format, operation) in [
+			(InputFormat::Completions, "chat"),
+			(InputFormat::Messages, "chat"),
+			(InputFormat::Responses, "chat"),
+			(InputFormat::Gemini, "generate_content"),
+			(InputFormat::Embeddings, "embeddings"),
+			(InputFormat::Realtime, "realtime"),
+			(InputFormat::Rerank, "rerank"),
+			(InputFormat::CountTokens, "count_tokens"),
+			(InputFormat::GeminiCountTokens, "count_tokens"),
+			(InputFormat::Detect, "unknown"),
+		] {
+			for streaming in [false, true] {
+				for has_response in [false, true] {
+					let (mut log, registry) = test_request_log_with_registry();
+					let mut request = metric_test_llm_request();
+					request.input_format = format;
+					request.streaming = streaming;
+					log.llm_request = Some(request.clone());
+					if has_response {
+						log.llm_response.store(Some(llm::LLMInfo::new(
+							request,
+							llm::LLMResponse {
+								input_tokens: Some(10),
+								..Default::default()
+							},
+						)));
+						log.status = Some(http::StatusCode::OK);
+					} else {
+						log.error = Some("connection failed".to_string());
+					}
+					drop(DropOnLog::from(log));
+					let encoded = encoded_metrics(&registry);
+					let counts: Vec<_> = encoded
+						.lines()
+						.filter(|line| {
+							line.starts_with("gen_ai_server_request_duration_count")
+								|| line.starts_with("gen_ai_client_token_usage_count")
+						})
+						.collect();
+					assert_eq!(counts.len(), if has_response { 2 } else { 1 });
+					for count in counts {
+						assert!(
+							count.contains(&format!("gen_ai_operation_name=\"{operation}\"")),
+							"{count}"
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn gen_ai_request_duration_requires_a_recognized_llm_operation() {
+		let (mut log, registry) = test_request_log_with_registry();
+		log.status = Some(http::StatusCode::BAD_GATEWAY);
+		log.error = Some("connection failed".to_string());
+		log.reason = Some(ProxyResponseReason::UpstreamFailure);
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		assert!(
+			!encoded
+				.lines()
+				.any(|line| line.starts_with("gen_ai_server_request_duration_count")),
+			"non-GenAI request emitted a GenAI duration observation:\n{encoded}"
+		);
+	}
+
+	#[test]
+	fn gen_ai_error_type_is_specific_to_request_duration() {
+		let (mut log, registry) = test_request_log_with_registry();
+		let request = metric_test_llm_request();
+		let response = llm::LLMResponse {
+			input_tokens: Some(10),
+			output_tokens: Some(5),
+			..Default::default()
+		};
+		log.status = Some(http::StatusCode::INTERNAL_SERVER_ERROR);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+
+		let encoded = encoded_metrics(&registry);
+		let duration_count = encoded
+			.lines()
+			.find(|line| line.starts_with("gen_ai_server_request_duration_count"))
+			.unwrap_or_else(|| panic!("no GenAI request duration count in:\n{encoded}"));
+		assert!(duration_count.contains("error_type=\"_OTHER\""));
+		for token_line in encoded
+			.lines()
+			.filter(|line| line.starts_with("gen_ai_client_token_usage"))
+		{
+			assert!(
+				!token_line.contains("error_type="),
+				"token metric unexpectedly has error.type: {token_line}"
+			);
+		}
 	}
 
 	#[test]
@@ -3288,7 +3664,7 @@ mod tests {
 		let catalog_file = tempfile::NamedTempFile::new().unwrap();
 		fs_err::write(
 			catalog_file.path(),
-			r#"{"providers":{"openai":{"models":{"my-model":{"rates":{"input":"1","output":"2"}}}}}}"#,
+			r#"{"providers":{"openai":{"models":{"my-model":{"rates":{"input":"1","output":"2","perPage":"0.005"}}}}}}"#,
 		)
 		.unwrap();
 		let catalog = ModelCatalog::new(vec![crate::ModelCatalogSource::File {
@@ -3310,6 +3686,7 @@ mod tests {
 		let response = llm::LLMResponse {
 			input_tokens: Some(1_000_000),
 			output_tokens: Some(0),
+			pages: Some(4),
 			..Default::default()
 		};
 		for _ in 0..20 {
@@ -3347,6 +3724,16 @@ mod tests {
 		] {
 			assert!(has(expected), "expected {expected} span attribute");
 		}
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| attr.value.to_string())
+		};
+		// 1M input tokens at $1/1M plus 4 pages at $0.005/page: the page line is priced per page.
+		assert_eq!(value("agw.ai.usage.cost.pages").as_deref(), Some("0.020"));
+		assert_eq!(value("agw.ai.usage.cost.total").as_deref(), Some("1.020"));
 		assert!(
 			span
 				.attributes

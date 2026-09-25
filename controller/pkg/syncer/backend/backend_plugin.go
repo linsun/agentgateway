@@ -152,6 +152,9 @@ func BuildAgwBackend(
 	backend *agentgateway.AgentgatewayBackend,
 ) ([]*api.Backend, error) {
 	errs := []error{}
+	if owners := jwks.OwnersFromBackend(backend); len(owners) > 0 {
+		ctx.JWKSOwner = &owners[0]
+	}
 	pols, err := TranslateBackendPolicies(ctx, backend.Namespace, backend.Spec.Policies)
 	if err != nil {
 		errs = append(errs, err)
@@ -546,17 +549,27 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 		// TODO: publisher?
 		provider.Provider = &api.AIBackend_Provider_Vertex{
 			Vertex: &api.AIBackend_Vertex{
-				Region:    llm.VertexAI.Region,
+				Region:    ptr.NonEmptyOrDefault(llm.VertexAI.Region, "global"),
 				Model:     llm.VertexAI.Model,
 				ProjectId: llm.VertexAI.ProjectId,
 			},
 		}
 	} else if llm.Bedrock != nil {
-		region := llm.Bedrock.Region
+		region := ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1")
 		var guardrailIdentifier, guardrailVersion *string
 		if llm.Bedrock.Guardrail != nil {
 			guardrailIdentifier = &llm.Bedrock.Guardrail.GuardrailIdentifier
 			guardrailVersion = &llm.Bedrock.Guardrail.GuardrailVersion
+		}
+
+		endpointPreference := api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_PREFERRED
+		switch llm.Bedrock.EndpointPreference {
+		case agentgateway.BedrockEndpointPreferenceMantlePreferred:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_PREFERRED
+		case agentgateway.BedrockEndpointPreferenceMantleOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_MANTLE_ONLY
+		case agentgateway.BedrockEndpointPreferenceRuntimeOnly:
+			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY
 		}
 
 		provider.Provider = &api.AIBackend_Provider_Bedrock{
@@ -565,6 +578,7 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				Region:              region,
 				GuardrailIdentifier: guardrailIdentifier,
 				GuardrailVersion:    guardrailVersion,
+				EndpointPreference:  endpointPreference,
 			},
 		}
 	} else if llm.Custom != nil {

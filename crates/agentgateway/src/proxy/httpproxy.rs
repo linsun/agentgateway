@@ -47,7 +47,7 @@ use crate::store::{
 };
 use crate::telemetry::log;
 use crate::telemetry::log::{
-	AsyncLog, DropOnLog, LogBody, RequestLog, SpanWriteOnDrop, SpanWriter, TraceSampler,
+	AsyncLog, DropOnLog, RequestLog, SpanWriteOnDrop, SpanWriter, TraceSampler,
 };
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallLabels, OutboundCallSubtype};
 use crate::telemetry::trc::TraceParent;
@@ -105,9 +105,7 @@ async fn set_mcp_cel_context(req: &mut Request, backend: &McpBackend) {
 	};
 	let info = mcp::MCPInfo::from_request(req.headers(), &message, backend);
 	req.extensions_mut().insert(info);
-	req
-		.extensions_mut()
-		.insert(mcp::CachedRequest::new(body, message));
+	req.body_mut().insert_extension(mcp::CachedRequest(message));
 }
 
 fn select_route_chain(
@@ -364,6 +362,7 @@ async fn apply_request_policies(
 	Ok(route_retry)
 }
 
+#[allow(clippy::result_large_err)]
 async fn apply_backend_policies(
 	backend_info: auth::BackendInfo,
 	client: PolicyClient,
@@ -464,6 +463,7 @@ async fn apply_backend_policies(
 	Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 async fn apply_gateway_policies(
 	policies: &GatewayPolicies,
 	client: PolicyClient,
@@ -551,6 +551,7 @@ async fn apply_gateway_policies(
 	Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 async fn apply_llm_request_policies(
 	policies: &store::LLMRequestPolicies,
 	client: PolicyClient,
@@ -558,20 +559,49 @@ async fn apply_llm_request_policies(
 	llm_req: &LLMRequest,
 	response_headers: &mut HeaderMap,
 ) -> Result<store::LLMResponsePolicies, ProxyResponse> {
-	let local_rate_limit = policies
+	// Token limits are settled here, where the parsed request gives the token count and, for a
+	// keyed rule, the `llm` context its key may read.
+	let mut local_rate_limit = Vec::new();
+	let mut local_status: Option<http::localratelimit::RateLimitStatus> = None;
+	let limits = policies
 		.local_rate_limit
 		.as_deref()
-		.into_iter()
-		.flatten()
-		.filter(|rate_limit| rate_limit.spec.limit_type == http::localratelimit::RateLimitType::Tokens)
-		.cloned()
-		.collect::<Vec<_>>();
-	let mut local_status: Option<http::localratelimit::RateLimitStatus> = None;
-	for lrl in &local_rate_limit {
-		local_status = http::localratelimit::RateLimitStatus::most_constrained(
-			local_status,
-			lrl.check_llm_request(llm_req)?,
-		);
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	if !limits.is_empty() {
+		// The context costs a clone of the request, so it is only built for a key that reads it.
+		let reads_llm = |lrl: &http::localratelimit::RateLimit| {
+			lrl.spec.limit_type == http::localratelimit::RateLimitType::Tokens
+				&& lrl.spec.key.as_ref().is_some_and(|key| key.needs_llm())
+		};
+		let llm_ctx = limits.iter().any(reads_llm).then(|| {
+			cel::LLMContext::from_llm_info(
+				llm::LLMInfo {
+					request: llm_req.clone(),
+					response: Default::default(),
+				},
+				None,
+			)
+		});
+		let mut exec = cel::Executor::new_request(req);
+		if let Some(llm_ctx) = llm_ctx.as_ref() {
+			exec.llm = cel::ExtensionOrDirect::Direct(Some(llm_ctx));
+		}
+		let admitted = limits.iter().try_for_each(|lrl| {
+			if let Some((status, charged)) = lrl.charge_tokens(llm_req.input_tokens, &exec)? {
+				local_status =
+					http::localratelimit::RateLimitStatus::most_constrained(local_status, Some(status));
+				local_rate_limit.push(charged);
+			}
+			Ok::<(), ProxyError>(())
+		});
+		if let Err(e) = admitted {
+			// The request is rejected, so it must not count against the rules that admitted it.
+			for charged in &local_rate_limit {
+				charged.refund();
+			}
+			return Err(e.into());
+		}
 	}
 	if let Some(status) = local_status {
 		http::x_headers::set_ratelimit_headers(
@@ -621,11 +651,13 @@ trait ResultWithSnapshot<T, E>
 where
 	E: Into<ProxyResponse>,
 {
+	#[allow(clippy::result_large_err)]
 	fn snapshot_on_err(
 		self,
 		log: &mut RequestLog,
 		req: &mut Request,
 	) -> Result<T, SnapshottedProxyResponse>;
+	#[allow(clippy::result_large_err)]
 	fn maybe_snapshot_on_err(
 		self,
 		log: &mut RequestLog,
@@ -638,6 +670,7 @@ impl<T, E> ResultWithSnapshot<T, E> for Result<T, E>
 where
 	E: Into<ProxyResponse>,
 {
+	#[allow(clippy::result_large_err)]
 	fn snapshot_on_err(
 		self,
 		log: &mut RequestLog,
@@ -652,6 +685,7 @@ where
 			SnapshottedProxyResponse(e.into())
 		})
 	}
+	#[allow(clippy::result_large_err)]
 	fn maybe_snapshot_on_err(
 		self,
 		log: &mut RequestLog,
@@ -668,6 +702,7 @@ where
 			SnapshottedProxyResponse(e.into())
 		})
 	}
+	#[allow(clippy::result_large_err)]
 	fn explicitly_skip_snapshot(self) -> Result<T, SnapshottedProxyResponse> {
 		self.map_err(|e| SnapshottedProxyResponse(e.into()))
 	}
@@ -711,56 +746,18 @@ impl HTTPProxy {
 			.proxy_internal(req, log.as_mut().unwrap(), &mut response_policies)
 			.await
 			.map_err(|e| e.0);
-		let error = ret.as_ref().err().and_then(|e| match e {
-			ProxyResponse::Error(e) => Some(cel::ErrorContext {
-				reason: e.as_reason().to_string(),
-				message: e.to_string(),
-			}),
-			ProxyResponse::DirectResponse(_) => None,
-		});
-
-		log.with(|l| l.error = error.as_ref().map(|e| e.message.clone()));
-		let reason = match &ret {
-			Ok(_) => ProxyResponseReason::Upstream,
-			Err(e) => e.as_reason(),
-		};
-		let mut is_upstream_response = reason == ProxyResponseReason::Upstream;
-		let response_idle_timeout = response_policies
-			.timeout
-			.as_ref()
-			.and_then(|t| t.response_idle_timeout)
-			.filter(|d| !d.is_zero());
-		let mut resp = ret.unwrap_or_else(|err| match err {
-			ProxyResponse::Error(e) => e.into_response_with_grpc(is_grpc_request),
-			ProxyResponse::DirectResponse(dr) => *dr,
-		});
-		if let Some(error) = error {
-			if let Some(proxy) = resp.extensions_mut().get_mut::<cel::ProxyContext>() {
-				proxy.error = Some(error);
-			} else {
-				resp.extensions_mut().insert(cel::ProxyContext {
-					error: Some(error),
-					..Default::default()
-				});
-			}
-		}
+		let (mut resp, mut reason) = resolve_response(ret, log.as_mut().unwrap(), is_grpc_request);
+		let is_upstream_response = reason == ProxyResponseReason::Upstream;
 		if let Some(l) = log.as_mut() {
 			l.cel.ctx().maybe_buffer_response_body(&mut resp).await;
 		}
 
-		let mut resp = match response_policies
+		if let Err(failure) = response_policies
 			.apply(&mut resp, log.as_mut().unwrap(), is_upstream_response)
 			.await
 		{
-			Ok(_) => resp,
-			Err(e) => {
-				is_upstream_response = false;
-				match e {
-					ProxyResponse::Error(e) => e.into_response_with_grpc(is_grpc_request),
-					ProxyResponse::DirectResponse(dr) => *dr,
-				}
-			},
-		};
+			(resp, reason) = resolve_response(Err(failure), log.as_mut().unwrap(), is_grpc_request);
+		}
 		// LLM buffering deliberately leaves decoded bodies plain so response policies can safely read
 		// and replace them. Restore the upstream-selected encoding only after every such policy ran.
 		llm::encode_deferred_response(&mut resp);
@@ -789,13 +786,11 @@ impl HTTPProxy {
 				.await
 				.unwrap_or_else(|e| e.into_response_with_grpc(is_grpc_request))
 		} else {
-			if is_upstream_response && let Some(idle_timeout) = response_idle_timeout {
-				resp = http::timeout::apply_response_idle_timeout(resp, idle_timeout);
-			}
-			resp.map(move |b| http::Body::new(LogBody::new(b, log)))
+			resp.map(move |body| body.with_observer(log))
 		}
 	}
 
+	#[allow(clippy::result_large_err)]
 	async fn proxy_internal(
 		&self,
 		mut req: Request,
@@ -1007,6 +1002,7 @@ impl HTTPProxy {
 			let info = backend.backend_info();
 			req.extensions_mut().insert(BackendContext {
 				name: info.backend_name,
+				endpoint: None,
 				backend_type: info.backend_type,
 				protocol: backend
 					.backend_protocol()
@@ -1140,23 +1136,29 @@ impl HTTPProxy {
 			.timeout
 			.as_ref()
 			.and_then(|t| t.request_timeout);
-		let body = if attempts > 1 {
-			// If we are going to attempt a retry we will need to track the incoming bytes for replay
-			let body = http::retry::ReplayBody::try_new(body, MAX_BUFFERED_BYTES);
-			if body.is_err() {
-				debug!("initial body is too large to retry, disabling retries")
-			}
-			body
-		} else {
-			Err(body)
-		};
+		let mut replay_state = None;
+		let body =
+			if attempts > 1 && http_body::Body::size_hint(&body).lower() <= MAX_BUFFERED_BYTES as u64 {
+				// If we are going to attempt a retry we will need to track the incoming bytes for replay
+				let (content, state) = body.into_replay_parts();
+				replay_state = Some(state);
+				Ok(
+					http::retry::ReplayBody::try_new(content, MAX_BUFFERED_BYTES)
+						.expect("body size was checked before separating replay state"),
+				)
+			} else {
+				if attempts > 1 {
+					debug!("initial body is too large to retry, disabling retries");
+				}
+				Err(body)
+			};
 		let mut substrate_state = None;
 		let mut next = match body {
 			Ok(retry) => Some(retry),
 			Err(body) => {
 				trace!("no retries");
 				// no retries at all, just send the request as normal
-				let req = Request::from_parts(head, http::Body::new(body));
+				let req = Request::from_parts(head, body);
 				let response = self
 					.attempt_upstream(
 						log,
@@ -1207,7 +1209,11 @@ impl HTTPProxy {
 					HeaderValue::try_from(format!("{n}")).expect("number is always a valid header value"),
 				);
 			}
-			let req = Request::from_parts(head, http::Body::new(this));
+			let body = replay_state
+				.as_ref()
+				.expect("retry state is initialized")
+				.wrap(http::RawBody::new(this));
+			let req = Request::from_parts(head, body);
 			let mut res = self
 				.attempt_upstream(
 					log,
@@ -1271,6 +1277,7 @@ impl HTTPProxy {
 		unreachable!()
 	}
 
+	#[allow(clippy::result_large_err)]
 	fn connect_tunnel<'a>(
 		&'a self,
 		log: &'a mut RequestLog,
@@ -1292,6 +1299,7 @@ impl HTTPProxy {
 			.boxed()
 	}
 
+	#[allow(clippy::result_large_err)]
 	async fn connect_tunnel_inner(
 		&self,
 		log: &mut RequestLog,
@@ -1313,6 +1321,7 @@ impl HTTPProxy {
 			call_target: backend_call.target.clone(),
 			inputs: self.inputs.clone(),
 		};
+		set_backend_cel_context(req, Some(&log), Some(&backend_call.target));
 		{
 			let mut maybe_log = Some(&mut *log);
 			apply_backend_policies(
@@ -1326,7 +1335,6 @@ impl HTTPProxy {
 			.await?;
 		}
 		log.endpoint = Some(backend_call.target.clone());
-		set_backend_cel_context(req, Some(&log));
 		log.request_snapshot = snapshot_connect_request(log, req).map(Arc::new);
 
 		// CONNECT establishes a raw byte tunnel after any configured backend transport
@@ -1512,6 +1520,8 @@ impl HTTPProxy {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	#[allow(clippy::large_enum_variant)]
+	#[allow(clippy::result_large_err)]
 	async fn attempt_upstream(
 		&self,
 		log: &mut RequestLog,
@@ -2331,7 +2341,23 @@ async fn build_simple_backend_call(
 	Ok((backend_call, maybe_inference))
 }
 
+// Explicit policy routes retain their suffix semantics and override native model classification.
+fn resolve_llm_route_type(
+	policy: Option<&llm::Policy>,
+	model_route_type: Option<RouteType>,
+	path: &str,
+) -> RouteType {
+	if let Some(policy) = policy
+		&& !policy.routes.is_empty()
+	{
+		return policy.resolve_route(path);
+	}
+
+	model_route_type.unwrap_or(RouteType::Completions)
+}
+
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 async fn make_backend_call(
 	inputs: Arc<ProxyInputs>,
 	mut route_policies: Arc<store::LLMRequestPolicies>,
@@ -2344,15 +2370,20 @@ async fn make_backend_call(
 	substrate_state: &mut Option<http::substrate::SubstrateRequestState>,
 ) -> Result<Response, ProxyResponse> {
 	let resolved_backend;
+	let mut model_route_type = None;
 	let backend = if let Backend::LLMRouter(_, router) = backend {
 		// Model routing parses the LLM body before provider request processing.
 		req
 			.extensions_mut()
 			.get_or_insert_with(|| crate::transport::BufferLimit::new(llm::DEFAULT_BUFFER_LIMIT));
-		let resolved = match router.resolve(&mut req).await {
+		if let Some(path_match) = router.trace_path(&req) {
+			log.add(|log| log.path_match = Some(path_match));
+		}
+		let resolved = match router.resolve(&mut req, &inputs.model_catalog).await {
 			model_router::ResolveResult::DirectResponse(resp) => return Ok(resp),
 			model_router::ResolveResult::Backend(resolved) => resolved,
 		};
+		model_route_type = Some(resolved.route_type);
 		let selected_backend = resolve_backend(resolved.backend, inputs.as_ref())?;
 		let concrete_policies = get_backend_policies(
 			inputs.as_ref(),
@@ -2449,6 +2480,7 @@ async fn make_backend_call(
 				.sub_backend_policies(sub_backend_name, Some(&provider.inline_policies));
 
 			let provider_defaults = BackendPolicies {
+				health: ai.default_health.clone(),
 				llm_provider: Some(provider.clone()),
 				..Default::default()
 			};
@@ -2483,7 +2515,7 @@ async fn make_backend_call(
 				let provider_defaults = match &provider.host_override {
 					Some(_) => provider_defaults,
 					None => {
-						let mut pol = provider
+						let pol = provider
 							.provider
 							.default_connector_policies()
 							.ok_or_else(|| {
@@ -2492,8 +2524,7 @@ async fn make_backend_call(
 										.to_string(),
 								)
 							})?;
-						pol.llm_provider = Some(provider.clone());
-						pol
+						pol.merge(provider_defaults)
 					},
 				};
 				// Defaults for the provider < Backend level policies < Sub Backend
@@ -2504,13 +2535,15 @@ async fn make_backend_call(
 				);
 				// Resolve the LLM route before picking the connection target: some providers serve
 				// routes from different hosts (e.g. Bedrock rerank uses bedrock-agent-runtime).
-				let route_type = route_policies
-					.clone()
-					.merge_backend_policies(effective_policies.llm.clone())
-					.llm
-					.as_ref()
-					.map(|policy| policy.resolve_route(req.uri().path()))
-					.unwrap_or(llm::RouteType::Completions);
+				let route_type = resolve_llm_route_type(
+					route_policies
+						.clone()
+						.merge_backend_policies(effective_policies.llm.clone())
+						.llm
+						.as_deref(),
+					model_route_type,
+					req.uri().path(),
+				);
 				let target = match &provider.host_override {
 					Some(target) => target.clone(),
 					None => provider
@@ -2605,7 +2638,7 @@ async fn make_backend_call(
 		Backend::MCP(name, backend) => {
 			let inputs = inputs.clone();
 			let backend = backend.clone();
-			set_backend_cel_context(&mut req, log.as_ref());
+			set_backend_cel_context(&mut req, log.as_ref(), None);
 			let name = name.clone();
 			let Some(log) = log else {
 				return Err(
@@ -2631,6 +2664,7 @@ async fn make_backend_call(
 			.backend_policies
 			.register_cel_expressions(log.cel.ctx());
 	}
+	set_backend_cel_context(&mut req, log.as_ref(), Some(&backend_call.target));
 	// Apply auth before LLM request setup, so the providers can assume auth is in standardized header
 	// Apply auth as early as possible so any ext_proc or transformations won't be repeated on retries in case it fails.
 	let backend_info = auth::BackendInfo {
@@ -2670,7 +2704,7 @@ async fn make_backend_call(
 	let llm_request_policies =
 		route_policies.merge_backend_policies(backend_call.backend_policies.llm.clone());
 
-	set_backend_cel_context(&mut req, log.as_ref());
+	set_backend_cel_context(&mut req, log.as_ref(), Some(&backend_call.target));
 
 	let (mut req, llm_response_policies, llm_request) =
 		if let Some(llm) = &backend_call.backend_policies.llm_provider {
@@ -2679,11 +2713,11 @@ async fn make_backend_call(
 				.get_or_insert_with(|| crate::transport::BufferLimit::new(llm::DEFAULT_BUFFER_LIMIT));
 			// LLM requires CEL execution after the snapshot so we do not clear extensions
 			let mut req = req.take_and_snapshot_without_clearing_extensions(log.as_mut())?;
-			let route_type = llm_request_policies
-				.llm
-				.as_ref()
-				.map(|policy| policy.resolve_route(req.uri().path()))
-				.unwrap_or(llm::RouteType::Completions);
+			let route_type = resolve_llm_route_type(
+				llm_request_policies.llm.as_deref(),
+				model_route_type,
+				req.uri().path(),
+			);
 			if matches!(route_type, RouteType::Detect | RouteType::Passthrough)
 				&& let Some(provider_model) = llm.provider.override_model()
 			{
@@ -2770,6 +2804,7 @@ async fn make_backend_call(
 							req,
 							llm_request_policies.llm.as_deref(),
 							&mut log,
+							Some(inputs.model_catalog.as_handle()),
 						))
 						.await
 						.map_err(ProxyError::AIRequest)?,
@@ -2846,6 +2881,8 @@ async fn make_backend_call(
 							llm.path_override.as_deref(),
 							llm.path_prefix.as_deref(),
 							llm.host_override.is_some(),
+							Some(&mut backend_call.target),
+							Some(inputs.model_catalog.as_handle()),
 						)
 						.map_err(ProxyError::Processing)?;
 
@@ -2896,6 +2933,8 @@ async fn make_backend_call(
 							llm.path_override.as_deref(),
 							llm.path_prefix.as_deref(),
 							llm.host_override.is_some(),
+							Some(&mut backend_call.target),
+							Some(inputs.model_catalog.as_handle()),
 						)
 						.map_err(ProxyError::Processing)?;
 					if route_type == RouteType::Realtime {
@@ -2934,13 +2973,21 @@ async fn make_backend_call(
 			.assert_size::<{ 2 * 1024 }>()
 			.await?;
 			(
-				// Clearing extensions is fine; the HTTP codepath doesn't require usage after this point.
-				req.take_and_snapshot_clearing_extensions(log.as_mut())?,
+				// Internal handlers consume request attributes such as validated JWT claims.
+				if matches!(backend, Backend::Internal(_, _)) {
+					req.take_and_snapshot_without_clearing_extensions(log.as_mut())?
+				} else {
+					req.take_and_snapshot_clearing_extensions(log.as_mut())?
+				},
 				LLMResponsePolicies::default(),
 				None,
 			)
 		};
 	if let Some(llm) = &backend_call.backend_policies.llm_provider {
+		// `setup_request` may have rewritten the connection target to a model-aware host
+		// (e.g. Bedrock Mantle vs Runtime), so the endpoint captured earlier can be stale.
+		// Refresh it from the finalized target rather than coupling logging into authority setup.
+		log.add(|l| l.endpoint = Some(backend_call.target.clone()));
 		llm.provider.strip_browser_cors_headers(&mut req);
 		apply_auto_hostname(&mut req, &backend_call.target)?;
 		// Some auth types (AWS) need to be applied after all request processing
@@ -3076,6 +3123,17 @@ async fn make_backend_call(
 		),
 	});
 	let mut resp = resp?;
+	// Protect reads from the actual upstream before any policy buffers, transforms,
+	// or replaces its body. CONNECT tunnels take a separate path above.
+	if resp.status() != StatusCode::SWITCHING_PROTOCOLS
+		&& let Some(timeout) = response_policies
+			.timeout
+			.as_ref()
+			.and_then(|t| t.response_idle_timeout)
+			.filter(|d| !d.is_zero())
+	{
+		resp = http::timeout::apply_response_idle_timeout(resp, timeout);
+	}
 	if let Some(log) = log.as_ref() {
 		resp
 			.extensions_mut()
@@ -3139,6 +3197,7 @@ async fn make_backend_call(
 }
 
 /// Resolves a Substrate actor assignment into an in-process dynamic backend result.
+#[allow(clippy::result_large_err)]
 async fn handle_substrate_backend_selection(
 	req: &mut Request,
 	backend: &Backend,
@@ -3172,13 +3231,18 @@ async fn handle_substrate_backend_selection(
 	}
 }
 
-fn set_backend_cel_context(req: &mut http::Request, log: Option<&&mut RequestLog>) {
+fn set_backend_cel_context(
+	req: &mut http::Request,
+	log: Option<&&mut RequestLog>,
+	endpoint: Option<&Target>,
+) {
 	if let Some(l) = log
 		&& let Some(bp) = l.backend_protocol
 		&& let Some(bi) = &l.backend_info
 	{
 		req.extensions_mut().insert(BackendContext {
 			name: bi.backend_name.clone(),
+			endpoint: endpoint.map(|target| target.to_string().into()),
 			backend_type: bi.backend_type,
 			protocol: bp,
 		});
@@ -3596,7 +3660,52 @@ fn resolved_workload_target_hostname<'a>(
 	}
 }
 
-fn set_final_response_fields(
+// Resolve both the initial request and any response-policy replacement without consuming
+// response extensions. Final response fields must be captured once, after all policies run.
+pub(crate) fn resolve_response(
+	result: Result<Response, ProxyResponse>,
+	log: &mut RequestLog,
+	is_grpc_request: bool,
+) -> (Response, ProxyResponseReason) {
+	let reason = match &result {
+		Ok(_) => ProxyResponseReason::Upstream,
+		Err(failure) => failure.as_reason(),
+	};
+	let error = match &result {
+		Err(ProxyResponse::Error(error)) => Some(cel::ErrorContext {
+			reason: reason.to_string(),
+			message: match log.error.as_ref() {
+				Some(original) => {
+					format!("response policy failed: {error}; original request failed: {original}")
+				},
+				None => error.to_string(),
+			},
+		}),
+		_ => log.error.as_ref().map(|message| cel::ErrorContext {
+			reason: log.reason.unwrap_or(reason).to_string(),
+			message: message.clone(),
+		}),
+	};
+	log.reason = Some(reason);
+	log.error = error.as_ref().map(|error| error.message.clone());
+	let mut response = result.unwrap_or_else(|failure| match failure {
+		ProxyResponse::Error(error) => error.into_response_with_grpc(is_grpc_request),
+		ProxyResponse::DirectResponse(response) => *response,
+	});
+	if let Some(error) = error {
+		if let Some(context) = response.extensions_mut().get_mut::<cel::ProxyContext>() {
+			context.error = Some(error);
+		} else {
+			response.extensions_mut().insert(cel::ProxyContext {
+				error: Some(error),
+				..Default::default()
+			});
+		}
+	}
+	(response, reason)
+}
+
+pub(crate) fn set_final_response_fields(
 	log: &mut RequestLog,
 	reason: &ProxyResponseReason,
 	resp: &mut Response,
@@ -4176,22 +4285,41 @@ mod tests {
 		);
 	}
 
+	#[rstest::rstest]
+	#[case::default_health(503, json!({}))]
+	#[case::custom_condition(429, json!({"health": {"unhealthyExpression": "response.code == 429"}}))]
+	#[case::explicit_eviction(429, json!({"health": {
+		"unhealthyExpression": "response.code == 429",
+		"eviction": {"duration": "1s"}
+	}}))]
 	#[tokio::test]
-	async fn llm_retry_evicts_failed_priority_group_before_next_attempt() {
+	async fn llm_retry_records_failed_attempt_for_eviction(
+		#[case] status: u16,
+		#[case] policies: serde_json::Value,
+	) {
 		let primary = wiremock::MockServer::start().await;
+		// Supply an eviction duration for the custom condition without adding a retry delay.
 		Mock::given(wiremock::matchers::any())
-			.respond_with(ResponseTemplate::new(429))
+			.respond_with(ResponseTemplate::new(status).insert_header("retry-after", "60"))
+			.up_to_n_times(1)
+			.with_priority(1)
+			.expect(1)
 			.mount(&primary)
 			.await;
 
 		let fallback = wiremock::MockServer::start().await;
-		Mock::given(wiremock::matchers::any())
-			.respond_with(ResponseTemplate::new(200).set_body_raw(
-				include_bytes!("../../../llm/src/tests/response/completions/basic.json").to_vec(),
-				"application/json",
-			))
-			.mount(&fallback)
-			.await;
+		// The retry may reach either provider before the eviction worker processes the failure.
+		// Both succeed, so only the failed first attempt can trigger eviction.
+		for mock in [&primary, &fallback] {
+			Mock::given(wiremock::matchers::any())
+				.respond_with(ResponseTemplate::new(200).set_body_raw(
+					include_bytes!("../../../llm/src/tests/response/completions/basic.json").to_vec(),
+					"application/json",
+				))
+				.with_priority(2)
+				.mount(mock)
+				.await;
+		}
 
 		let mut bind = proxymock::setup_proxy_test("{}").expect("proxy test harness");
 		let local_backend: LocalAIBackend = serde_json::from_value(json!({
@@ -4205,14 +4333,7 @@ mod tests {
 								"model": null
 							}
 						},
-						"policies": {
-							"health": {
-								"unhealthyExpression": "response.code == 429",
-								"eviction": {
-									"duration": "1s"
-								}
-							}
-						}
+						"policies": policies
 					}]
 				},
 				{
@@ -4229,15 +4350,14 @@ mod tests {
 			]
 		}))
 		.expect("local AI backend");
-		let backend = Backend::AI(
-			ResourceName::new("llm".into(), "".into()),
-			local_backend
-				.translate(&crate::resource_manager::ResourceFetcher::direct(
-					bind.pi.upstream.clone(),
-				))
-				.await
-				.expect("translated backend"),
-		);
+		let ai = local_backend
+			.translate(&crate::resource_manager::ResourceFetcher::direct(
+				bind.pi.upstream.clone(),
+			))
+			.await
+			.expect("translated backend");
+		let providers = ai.providers.clone();
+		let backend = Backend::AI(ResourceName::new("llm".into(), "".into()), ai);
 		bind
 			.pi
 			.stores
@@ -4251,8 +4371,7 @@ mod tests {
 			.attach_route_policy(json!({
 				"retry": {
 					"attempts": 1,
-					"backoff": "10ms",
-					"codes": [429]
+					"codes": [status]
 				},
 				"ai": {
 					"routes": {
@@ -4272,24 +4391,33 @@ mod tests {
 		.await;
 
 		assert_eq!(res.status(), 200);
+		proxymock::read_body_raw(res.into_body()).await;
+
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			while !providers.iter().index().contains_key("fallback") {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("failed attempt should eventually evict the primary provider");
 
 		let primary_requests = primary
 			.received_requests()
 			.await
 			.expect("primary request recording");
-		assert_eq!(primary_requests.len(), 1);
 
 		let fallback_requests = fallback
 			.received_requests()
 			.await
 			.expect("fallback request recording");
-		assert_eq!(fallback_requests.len(), 1);
+		assert_eq!(primary_requests.len() + fallback_requests.len(), 2);
 		assert_eq!(
-			fallback_requests[0]
-				.headers
-				.get("x-retry-attempt")
-				.and_then(|v| v.to_str().ok()),
-			Some("1")
+			primary_requests
+				.iter()
+				.chain(&fallback_requests)
+				.filter(|r| r.headers.get("x-retry-attempt").is_some_and(|v| v == "1"))
+				.count(),
+			1
 		);
 	}
 }
@@ -4332,14 +4460,14 @@ async fn send_mirror(
 // RFC 2616, but is deliberately absent here. It is not stripped so
 // that request policies such as `basicAuth` can read it when the
 // gateway acts as an authenticated forward proxy.
-static HOP_HEADERS: [HeaderName; 8] = [
+// Preserve Trailer so Hyper's HTTP/1 encoder can forward the declared trailer fields.
+static HOP_HEADERS: [HeaderName; 7] = [
 	header::CONNECTION,
 	// non-standard but still sent by libcurl and rejected by e.g. google
 	HeaderName::from_static("proxy-connection"),
 	HeaderName::from_static("keep-alive"),
 	header::PROXY_AUTHENTICATE,
 	header::TE,
-	header::TRAILER,
 	header::TRANSFER_ENCODING,
 	header::UPGRADE,
 ];
@@ -4681,6 +4809,7 @@ impl ResponsePolicies {
 		None
 	}
 
+	#[allow(clippy::result_large_err)]
 	pub async fn apply(
 		&mut self,
 		resp: &mut Response,
@@ -5069,10 +5198,14 @@ impl PolicyClient {
 
 	fn internal_call_with_policies<'a>(
 		&'a self,
-		req: Request,
+		mut req: Request,
 		backend: Backend,
 		pols: BackendPolicies,
 	) -> Pin<Box<dyn Future<Output = Result<Response, ProxyError>> + Send + '_>> {
+		// Preserve caller timeouts; backend policies can override this fallback.
+		req
+			.extensions_mut()
+			.get_or_insert(BackendRequestTimeout(Duration::from_secs(10)));
 		let mut req = Some(req);
 		Box::pin(async move {
 			let mut response_policies = Default::default();
@@ -5102,6 +5235,9 @@ impl PolicyClient {
 		&self,
 		mut req: Request,
 	) -> Pin<Box<dyn Future<Output = Result<Response, ProxyError>> + Send + '_>> {
+		req
+			.extensions_mut()
+			.get_or_insert(BackendRequestTimeout(Duration::from_secs(10)));
 		Box::pin(async move {
 			let start = std::time::Instant::now();
 			let mut span = self.start_outbound_span(&mut req);

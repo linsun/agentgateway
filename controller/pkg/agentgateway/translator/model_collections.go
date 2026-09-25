@@ -60,13 +60,9 @@ func AgwModelCollection(
 	return modelResources, attachments, ancestors
 }
 
-// extractModelAncestorBackends mirrors extractAncestorBackends for AgentgatewayModels, so
-// backends referenced only by a model (spec.custom.backendRef) still resolve to their
-// Gateways in the reference index.
-// It also handles the indirect relationship: virtualModel.failover → concrete model → backendRef.
-// When a virtual model uses failover to reference a concrete model whose Custom provider
-// targets a backend (e.g. InferencePool), the virtual model's Gateways are propagated to
-// that backend's ancestor index.
+// extractModelAncestorBackends mirrors extractAncestorBackends for AgentgatewayModels.
+// It includes provider and inline-policy backends from the model and its concrete
+// failover targets.
 func extractModelAncestorBackends(ctx RouteContext, model *agentgateway.AgentgatewayModel) []*utils.AncestorBackend {
 	source := utils.TypedNamespacedName{
 		Namespace: model.Namespace,
@@ -85,25 +81,35 @@ func extractModelAncestorBackends(ctx RouteContext, model *agentgateway.Agentgat
 
 	// Collect all reachable backends (deduplicated).
 	backends := sets.Set[utils.TypedNamespacedName]{}
-
-	// Case 1: Direct Custom provider backendRef (existing behavior).
-	if custom := model.Spec.Custom; custom != nil && custom.BackendRef != nil {
-		backends.Insert(backendRefToTypedNamespacedName(model.Namespace, custom.BackendRef))
+	collectConcreteModelBackends := func(concrete *agentgateway.AgentgatewayModel) {
+		if custom := concrete.Spec.Custom; custom != nil && custom.BackendRef != nil {
+			backends.Insert(backendRefToTypedNamespacedName(concrete.Namespace, custom.BackendRef))
+		}
+		if policies := modelBackendPolicy(concrete.Spec.Policies); policies != nil {
+			plugins.BackendReferencesFromBackendPolicy(policies, func(ref gwv1.BackendObjectReference) {
+				groupKind := NormalizeReference(ref.Group, ref.Kind, wellknown.ServiceGVK.GroupKind())
+				if !ancestorBackendAllowed(ctx, wellknown.AgentgatewayModelGVK, concrete.Namespace, groupKind, ref.Namespace, ref.Name) {
+					return
+				}
+				backends.Insert(utils.TypedNamespacedName{
+					Namespace: defaultString(ref.Namespace, concrete.Namespace),
+					Name:      string(ref.Name),
+					Kind:      groupKind.Kind,
+				})
+			})
+		}
 	}
+	collectConcreteModelBackends(model)
 
-	// Case 2: Virtual model failover → concrete model → Custom backendRef.
+	// Virtual model failover → concrete model → backendRefs.
 	// Failover targets must be concrete models (enforced by modelFailoverBackend runtime check).
-	// Concrete models' Custom.backendRef can only target Service or InferencePool (CEL constraint).
 	if vm := model.Spec.VirtualModel; vm != nil && vm.Failover != nil {
 		for _, target := range vm.Failover.Targets {
 			refModel, _, err := translateFailoverTarget(ctx, model.Namespace, target)
 			if err != nil {
 				continue // Invalid targets are omitted from both ancestry and the generated failover backend.
 			}
-			if refCustom := refModel.Spec.Custom; refCustom != nil && refCustom.BackendRef != nil {
-				// backendRef is namespace-local; use the concrete model's namespace.
-				backends.Insert(backendRefToTypedNamespacedName(refModel.Namespace, refCustom.BackendRef))
-			}
+			collectConcreteModelBackends(refModel)
 		}
 	}
 
@@ -325,11 +331,6 @@ func translateModelForParents(
 	parentRefs []RouteParentReference,
 	routeReporter reporter.RouteReporter,
 ) []agwir.AgwResource {
-	allowed := map[string]struct{}{}
-	for _, p := range FilteredReferences(parentRefs) {
-		allowed[modelParentKey(p)] = struct{}{}
-	}
-
 	type parentAgg struct {
 		anyAllowed bool
 		parentRefs []RouteParentReference
@@ -350,7 +351,7 @@ func translateModelForParents(
 	var resources []agwir.AgwResource
 	var conversionErr *reporter.RouteCondition
 	for _, parent := range parentRefs {
-		if _, ok := allowed[modelParentKey(parent)]; !ok {
+		if parent.DeniedReason != nil {
 			continue
 		}
 		if a := agg[parentStatusKey(parent)]; a != nil {
@@ -380,7 +381,6 @@ func translateModelForParents(
 			prStatusRef.Kind = new(gwv1.Kind(parent.ParentKey.Kind))
 			prStatusRef.Namespace = new(gwv1.Namespace(parent.ParentKey.Namespace))
 			prStatusRef.Name = gwv1.ObjectName(parent.ParentKey.Name)
-			prStatusRef.SectionName = nil
 
 			pr := routeReporter.ParentRef(&prStatusRef)
 			if a.anyAllowed {
@@ -421,11 +421,8 @@ func translateModelForParents(
 }
 
 func parentStatusKey(parent RouteParentReference) string {
-	return fmt.Sprintf("%s/%s/%s", parent.ParentKey.Namespace, parent.ParentKey.Name, parent.ParentKey.Kind)
-}
-
-func modelParentKey(parent RouteParentReference) string {
-	return fmt.Sprintf("%s/%s/%s/%s", parent.ParentKey.Namespace, parent.ParentKey.Name, parent.ParentKey.Kind, string(parent.ParentSection))
+	return fmt.Sprintf("%s/%s/%s/%s/%d", parent.ParentKey.Namespace, parent.ParentKey.Name, parent.ParentKey.Kind,
+		ptr.OrEmpty(parent.OriginalReference.SectionName), ptr.OrEmpty(parent.OriginalReference.Port))
 }
 
 func convertAgentgatewayModel(ctx RouteContext, model *agentgateway.AgentgatewayModel, parent RouteParentReference) ([]*api.Resource, error) {
@@ -495,7 +492,7 @@ func translateVirtualModel(ctx RouteContext, model *agentgateway.AgentgatewayMod
 			}
 			targets = append(targets, &api.ModelRoute_VirtualModel_Weighted_Target{
 				Model:   modelName,
-				Weight:  uint32(target.Weight), //nolint:gosec // CEL constrains this to positive int32.
+				Weight:  uint32(ptr.NonEmptyOrDefault(target.Weight, 1)), //nolint:gosec // CEL constrains this to positive int32.
 				Invalid: err != nil,
 			})
 		}
@@ -700,7 +697,7 @@ func translateModelLLMProvider(ctx RouteContext, namespace string, model *agentg
 		provider.Provider = &api.AIBackend_Provider_Gemini{Gemini: &api.AIBackend_Gemini{Model: providerModel(selectedModel, llm.Gemini.Model)}}
 	case llm.VertexAI != nil:
 		provider.Provider = &api.AIBackend_Provider_Vertex{Vertex: &api.AIBackend_Vertex{
-			Region:    llm.VertexAI.Region,
+			Region:    ptr.NonEmptyOrDefault(llm.VertexAI.Region, "global"),
 			Model:     providerModel(selectedModel, llm.VertexAI.Model),
 			ProjectId: llm.VertexAI.ProjectId,
 		}}
@@ -712,7 +709,7 @@ func translateModelLLMProvider(ctx RouteContext, namespace string, model *agentg
 		}
 		provider.Provider = &api.AIBackend_Provider_Bedrock{Bedrock: &api.AIBackend_Bedrock{
 			Model:               providerModel(selectedModel, llm.Bedrock.Model),
-			Region:              llm.Bedrock.Region,
+			Region:              ptr.NonEmptyOrDefault(llm.Bedrock.Region, "us-east-1"),
 			GuardrailIdentifier: guardrailIdentifier,
 			GuardrailVersion:    guardrailVersion,
 		}}
@@ -745,17 +742,7 @@ func translateModelPolicies(ctx RouteContext, namespace string, model *agentgate
 	}
 
 	policies := model.Policies
-	backend := &agentgateway.BackendFull{}
-	backend.BackendSimple.Auth = policies.Auth.BackendAuth()
-	backend.BackendSimple.TLS = policies.TLS
-	backend.BackendSimple.Tunnel = policies.Tunnel
-	backend.Health = policies.Health
-	if policies.PromptGuard != nil {
-		backend.AI = &agentgateway.BackendAI{
-			PromptGuard: policies.PromptGuard,
-		}
-	}
-	translated, err := translateInlineModelBackendPolicy(ctx, namespace, backend)
+	translated, err := translateInlineModelBackendPolicy(ctx, namespace, modelBackendPolicy(policies))
 	if err != nil {
 		return nil, err
 	}
@@ -769,6 +756,21 @@ func translateModelPolicies(ctx RouteContext, namespace string, model *agentgate
 		translated = append(translated, &api.BackendPolicySpec{Kind: &api.BackendPolicySpec_ResponseHeaderModifier{ResponseHeaderModifier: response}})
 	}
 	return translated, nil
+}
+
+func modelBackendPolicy(policies *agentgateway.ModelPolicies) *agentgateway.BackendFull {
+	if policies == nil {
+		return nil
+	}
+	backend := &agentgateway.BackendFull{}
+	backend.BackendSimple.Auth = policies.Auth.BackendAuth()
+	backend.BackendSimple.TLS = policies.TLS
+	backend.BackendSimple.Tunnel = policies.Tunnel
+	backend.Health = policies.Health
+	if policies.PromptGuard != nil {
+		backend.AI = &agentgateway.BackendAI{PromptGuard: policies.PromptGuard}
+	}
+	return backend
 }
 
 func translateModelRouteAIPolicy(ctx RouteContext, namespace string, policies *agentgateway.ModelPolicies) (*api.BackendPolicySpec_Ai, error) {
@@ -983,7 +985,13 @@ func translateModelVisibility(visibility agentgateway.ModelVisibility) api.Model
 }
 
 func modelRouteKey(model *agentgateway.AgentgatewayModel, parent RouteParentReference) string {
-	return config.NamespacedName(model).String() + modelRouteKeySuffix(parent)
+	key := config.NamespacedName(model).String() + modelRouteKeySuffix(parent)
+	if parent.ParentKey.Kind == wellknown.HTTPRouteKind {
+		// An HTTPRoute rule may attach to multiple listeners on the same Gateway.
+		// Backends can be shared, but model routes carry a specific listener key.
+		key += "." + parent.ListenerKey[strings.LastIndex(parent.ListenerKey, ".")+1:]
+	}
+	return key
 }
 
 func modelBackendKey(model *agentgateway.AgentgatewayModel, parent RouteParentReference, target string) string {
